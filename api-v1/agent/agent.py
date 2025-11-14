@@ -6,7 +6,11 @@ import re
 from typing import Any, Dict, List, Optional
 from dotenv import load_dotenv
 import os
+import re
+import json
 from google.adk.models.lite_llm import LiteLlm
+from google.adk import Agent
+from tools_config import FusefyAPITools, FUSEFY_API_TOOLS
 
 load_dotenv()
 
@@ -25,25 +29,18 @@ def extract_token_from_message(message: str) -> tuple[str, str]:
 
     return message, None
 
-# Simplified tool executor - let the LLM handle function selection
-async def execute_fusefy_tool(function_call: dict):
+# Tool executor that routes to FusefyAPITools
+async def execute_fusefy_tool(function_name: str, args: Optional[Dict] = None):
     """
-    Execute Fusefy API tools based on LLM's function call decision
+    Execute Fusefy API tools based on function name and arguments
 
     Args:
-        function_call: Dictionary containing 'name' and 'arguments' from LLM
+        function_name: Name of the function to execute
+        args: Dictionary of arguments to pass to the function
     """
     try:
-        function_name = function_call.get("name")
-        args = function_call.get("arguments", {})
-
-        # Ensure token is present
-        token = args.get("token")
-        if not token:
-            return {
-                "error": "Authentication token is required. Please provide a valid JWT token.",
-                "status": 401
-            }
+        if args is None:
+            args = {}
 
         # Get the actual function from FusefyAPITools
         if hasattr(FusefyAPITools, function_name):
@@ -54,187 +51,40 @@ async def execute_fusefy_tool(function_call: dict):
             return {"error": f"Function {function_name} not found in FusefyAPITools"}
 
     except Exception as e:
-        return {"error": f"Tool execution error: {str(e)}"}
+        return {"error": f"Tool execution error: {str(e)}", "function": function_name}
 
 # System prompt for the agent
-SYSTEM_PROMPT = """You are the Fusefy API Assistant, specialized in helping users interact with the comprehensive Fusefy platform.
+SYSTEM_PROMPT = """You are the Fusefy API Assistant for the Fusefy compliance and security platform.
 
-AUTHENTICATION: All API calls require a JWT token. When you see [AUTH_TOKEN: ...] in the message, extract and use that token for all API calls.
+AUTHENTICATION: All API calls require a JWT token in the 'token' header. Extract from [AUTH_TOKEN: ...] and pass to all functions.
 
-## Your Capabilities:
-- Manage frameworks, controls, assessments, and use cases
-- Handle cloud resources (AWS S3, Azure Blob, Lambda)
-- Provide analytics and insights (metrics, TCO, adoption insights)
-- Manage tenants and users
-- Handle documents and policies
-- Send emails via standard or AWS SES
-- Perform CRUD operations on all resources
+## Available Resources (all support list/get/create/update/delete):
+- Frameworks & Controls: manage_frameworks, manage_controls
+- Assessments: manage_assessments, manage_usecases, manage_usecase_assessment
+- Tenant: manage_tenant, manage_tenant_details
+- Documents: manage_documents, manage_policy_documents
+- Cloud: manage_aws_s3, manage_azure_blob, manage_lambda, manage_cloud_providers, manage_cloud_frameworks
+- Metrics: manage_methodology_metrics, manage_tco, manage_adoption_insights, manage_model_validation
+- Other: manage_features, manage_grading_types, manage_app_metadata
+- Email: send_email (use_aws=True for AWS SES)
+- General: call_fusefy_api (direct endpoint access), list_available_endpoints
 
-## Important Guidelines:
-1. Always extract and use the JWT token from [AUTH_TOKEN: ...] format
-2. Choose the appropriate function based on user's request
-3. Handle errors gracefully and provide helpful feedback
-4. Present data in a clear, organized format
-5. Explain what each operation does when asked
+## Guidelines:
+1. Always pass JWT token to all function calls
+2. For file uploads: automatically analyze based on type
+3. Use call_fusefy_api for endpoints not covered by specific functions
+4. Present data clearly, handle errors gracefully
 
-You have access to various functions that the system will automatically route based on your selection."""
+API: https://85tb7na8f9.execute-api.us-east-1.amazonaws.com"""
 
-# Define the tools/functions for the LLM to use
-# This should match your actual FusefyAPITools methods
-FUSEFY_TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "call_fusefy_api",
-            "description": "Make a direct API call to any Fusefy endpoint",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "endpoint": {
-                        "type": "string",
-                        "description": "API endpoint path (e.g., /frameworks, /controls)"
-                    },
-                    "method": {
-                        "type": "string",
-                        "enum": ["GET", "POST", "PUT", "DELETE"],
-                        "description": "HTTP method"
-                    },
-                    "resource_id": {
-                        "type": "string",
-                        "description": "Optional resource ID for specific resource operations"
-                    },
-                    "data": {
-                        "type": "object",
-                        "description": "Request body data for POST/PUT requests"
-                    },
-                    "params": {
-                        "type": "object",
-                        "description": "Query parameters"
-                    },
-                    "token": {
-                        "type": "string",
-                        "description": "JWT authentication token"
-                    }
-                },
-                "required": ["endpoint", "method", "token"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_available_endpoints",
-            "description": "List all available Fusefy API endpoints",
-            "parameters": {
-                "type": "object",
-                "properties": {},
-                "required": []
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "manage_frameworks",
-            "description": "Manage compliance and security frameworks",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "operation": {
-                        "type": "string",
-                        "enum": ["list", "get", "create", "update", "delete"],
-                        "description": "Operation to perform"
-                    },
-                    "framework_id": {
-                        "type": "string",
-                        "description": "Framework ID for get/update/delete operations"
-                    },
-                    "data": {
-                        "type": "object",
-                        "description": "Framework data for create/update operations"
-                    },
-                    "token": {
-                        "type": "string",
-                        "description": "JWT authentication token"
-                    }
-                },
-                "required": ["operation", "token"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "manage_controls",
-            "description": "Manage security and compliance controls",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "operation": {
-                        "type": "string",
-                        "enum": ["list", "get", "create", "update", "delete"],
-                        "description": "Operation to perform"
-                    },
-                    "control_id": {
-                        "type": "string",
-                        "description": "Control ID for get/update/delete operations"
-                    },
-                    "data": {
-                        "type": "object",
-                        "description": "Control data for create/update operations"
-                    },
-                    "token": {
-                        "type": "string",
-                        "description": "JWT authentication token"
-                    }
-                },
-                "required": ["operation", "token"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "send_email",
-            "description": "Send email via standard service or AWS SES",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "email_data": {
-                        "type": "object",
-                        "description": "Email data including to, subject, body",
-                        "properties": {
-                            "to": {"type": "string"},
-                            "subject": {"type": "string"},
-                            "body": {"type": "string"},
-                            "from": {"type": "string"}
-                        }
-                    },
-                    "use_aws": {
-                        "type": "boolean",
-                        "description": "Use AWS SES if true, standard email if false"
-                    },
-                    "token": {
-                        "type": "string",
-                        "description": "JWT authentication token"
-                    }
-                },
-                "required": ["email_data", "token"]
-            }
-        }
-    }
-    # Add more function definitions as needed
-]
 
-# Create the agent with simplified configuration
-# try:
-    # Using LiteLLM with OpenAI
+
+# Create the agent - tools handled manually in router
 FUSE_USECASE_AGENT = Agent(
-        name="fusefy_agent",
-        model=LiteLlm(model="openai/gpt-4o"),
-        instruction=SYSTEM_PROMPT,
-        tools=[execute_fusefy_tool],  # Pass the function definitions  
-    )
+    name="fusefy_agent",
+    model=LiteLlm(model="openai/gpt-4o"),
+    instruction=SYSTEM_PROMPT
+)
 print("Successfully created Fusefy Agent with LiteLLM")
 
 
